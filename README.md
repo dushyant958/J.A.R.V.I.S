@@ -1,167 +1,242 @@
-# F.R.I.D.A.Y. — Tony Stark Demo
+# J.A.R.V.I.S
 
-> *"Fully Responsive Intelligent Digital Assistant for You"*
+> *"Just A Rather Very Intelligent System"* — a Tony Stark-inspired, voice-controlled personal AI that runs on your own machine.
 
-A Tony Stark-inspired AI assistant split into two cooperating pieces:
+J.A.R.V.I.S is a fully local-first voice assistant built around a **LiveKit Agents** voice pipeline and a **FastMCP** tool server. It listens through your microphone, reasons with an LLM, speaks back in a natural voice, and can actually *drive your computer* — open apps, search the web, read the news, click, type, take screenshots, and more.
 
-| Component | What it is |
-|-----------|-----------|
-| **MCP Server** (`uv run friday`) | A [FastMCP](https://github.com/jlowin/fastmcp) server that exposes tools (news, web search, system info, …) over SSE. Think of it as the Stark Industries backend — it does the actual work. |
-| **Voice Agent** (`uv run friday_voice`) | A [LiveKit Agents](https://github.com/livekit/agents) voice pipeline that listens to your microphone, reasons with an LLM (Gemini 2.5 Flash by default), and speaks back with OpenAI TTS — all while pulling tools from the MCP server in real time. |
-
-Demo: [Instagram reel](https://www.instagram.com/p/DW2HjYtkwg_/)
-
-[![Demo Video Guide](https://img.youtube.com/vi/mMY9swqe3BI/maxresdefault.jpg)](https://www.youtube.com/watch?v=mMY9swqe3BI)
+It is woken up by a wake word (a double clap + the keyword "JARVIS"), talks to you in real time, and remembers things across sessions via a Supabase + Redis backend.
 
 ---
 
-## How it works
+## Features
+
+- **Wake-word activation** — double clap followed by saying *"JARVIS"* (`friday/wake/detector.py`)
+- **Real-time voice pipeline** — STT → LLM → TTS over LiveKit Agents
+- **MCP tool system** — every capability is exposed as an MCP tool, so the LLM can call them dynamically
+- **Desktop control** — open applications, click, type, take screenshots, manage windows, run shell commands
+- **Web tools** — DuckDuckGo search, URL fetching, world news, weather, open-URL
+- **System tools** — current time, system info
+- **Persistent memory** — Supabase Postgres for conversations / preferences / memories
+- **Caching layer** — Redis Cloud with a `@cached(ttl=...)` decorator for tool responses
+- **Auto-start on boot** — `setup_autostart.py` wires JARVIS into Windows startup
+
+---
+
+## Architecture
 
 ```
-Microphone ──► STT (Sarvam Saaras v3)
-                    │
-                    ▼
-             LLM (Gemini 2.5 Flash)  ◄──────► MCP Server (FastMCP / SSE)
-                    │                              ├─ get_world_news
-                    ▼                              ├─ open_world_monitor
-             TTS (OpenAI nova)                     ├─ search_web
-                    │                              └─ …more tools
-                    ▼
-             Speaker / LiveKit room
+                    ┌────────────────────┐
+   Double clap ────►│   Wake Detector    │  (clap × 2 + "JARVIS" keyword)
+   + "JARVIS"       └─────────┬──────────┘
+                              │ wakes
+                              ▼
+┌────────────────────────────────────────────────────────┐
+│                   LiveKit Voice Agent                  │
+│                    (agent_friday.py)                   │
+│                                                        │
+│   Mic ─► STT (Sarvam Saaras v3)                        │
+│            │                                           │
+│            ▼                                           │
+│          LLM (Groq llama-3.3-70b, Gemini fallback)     │
+│            │         ▲                                 │
+│            │         │ tool calls / results            │
+│            ▼         │                                 │
+│          TTS (OpenAI nova) ─► Speaker                  │
+└────────────────────────┬───────────────────────────────┘
+                         │ SSE
+                         ▼
+              ┌────────────────────────┐
+              │   FastMCP Server       │  (server.py, :8000/sse)
+              │                        │
+              │   friday/tools/        │
+              │    ├─ web.py           │  search_web, fetch_url,
+              │    │                   │  get_world_news, weather, open_url
+              │    ├─ desktop.py       │  open_app, type_text, click,
+              │    │                   │  screenshot, list_windows, run_shell
+              │    └─ system.py        │  get_current_time, get_system_info
+              └───────────┬────────────┘
+                          │
+              ┌───────────┴────────────┐
+              ▼                        ▼
+     ┌──────────────┐          ┌──────────────┐
+     │  Supabase    │          │ Redis Cloud  │
+     │  (asyncpg)   │          │  (cache)     │
+     │              │          │              │
+     │ conversations│          │ tool_cache   │
+     │ preferences  │          │              │
+     │ memories     │          │              │
+     └──────────────┘          └──────────────┘
 ```
 
-The voice agent connects to the MCP server via SSE at `http://127.0.0.1:8000/sse` (auto-resolved to the Windows host IP when running inside WSL).
+---
+
+## Tech stack
+
+| Layer | Choice |
+|-------|--------|
+| LLM (primary) | Groq `llama-3.3-70b-versatile` |
+| LLM (fallback) | Google Gemini 2.5 Flash |
+| STT | Sarvam Saaras v3 (Indian-English optimised) |
+| TTS | OpenAI `nova` |
+| Voice framework | LiveKit Agents ≥ 1.5.1 |
+| Tool framework | FastMCP (SSE transport) |
+| Database | Supabase Postgres via `asyncpg` |
+| Cache | Redis Cloud (`redis[asyncio]`) |
+| Desktop control | `pyautogui`, `pygetwindow`, `Pillow` |
+| Wake word | `sounddevice` + `SpeechRecognition` + custom clap detector |
+| Package manager | `uv` |
 
 ---
 
 ## Project structure
 
 ```
-friday-tony-stark-demo/
-├── server.py           # uv run friday  → starts the MCP server (SSE on :8000)
-├── agent_friday.py     # uv run friday_voice → starts the LiveKit voice agent
-├── pyproject.toml
-├── .env.example        # copy → .env and fill in your keys
+J.A.R.V.I.S/
+├── server.py              # uv run friday       → FastMCP server (SSE :8000)
+├── agent_friday.py        # uv run friday_voice → LiveKit voice agent
+├── wake.py                # uv run jarvis_wake  → wake-word listener
+├── launcher.py            # orchestrates server + agent + wake together
+├── setup_autostart.py     # installs JARVIS into Windows startup
 │
-└── friday/             # MCP server package
-    ├── config.py       # env-var loading & app-wide settings
-    ├── tools/          # MCP tools (callable by the LLM)
-    │   ├── web.py      # search_web, fetch_url, get_world_news, open_world_monitor
-    │   ├── system.py   # get_current_time, get_system_info
-    │   └── utils.py    # format_json, word_count
-    ├── prompts/        # MCP prompt templates (summarize, explain_code, …)
-    └── resources/      # MCP resources exposed to clients (friday://info)
+├── pyproject.toml
+├── .env.example           # copy → .env and fill in keys
+│
+├── migrations/
+│   └── init.sql           # Supabase schema
+│
+└── friday/                # MCP server package
+    ├── config.py          # env-var loading & settings
+    ├── db/
+    │   ├── supabase_client.py  # async Postgres client
+    │   └── redis_cache.py      # @cached decorator
+    ├── wake/
+    │   └── detector.py         # ClapDetector + KeywordListener
+    └── tools/
+        ├── __init__.py    # tool registration
+        ├── web.py         # search, news, weather, fetch
+        ├── desktop.py     # full PC control
+        ├── system.py      # time, system info
+        └── utils.py
 ```
 
 ---
 
-## Quick start
+## Setup
 
-### 1. Prerequisites
-
-- Python ≥ 3.11
-- [`uv`](https://github.com/astral-sh/uv) — `pip install uv` or `curl -Lsf https://astral.sh/uv/install.sh | sh`
-- A [LiveKit Cloud](https://cloud.livekit.io) project (free tier works)
-
-### 2. Clone & install
+### 1. Clone
 
 ```bash
-git clone https://github.com/SAGAR-TAMANG/friday-tony-stark-demo.git
-cd friday-tony-stark-demo
-uv sync          # creates .venv and installs all dependencies
+git clone https://github.com/dushyant958/J.A.R.V.I.S.git
+cd J.A.R.V.I.S
 ```
 
-### 3. Set up environment
+### 2. Install dependencies
+
+This project uses [`uv`](https://github.com/astral-sh/uv):
+
+```bash
+uv sync
+```
+
+### 3. Environment variables
+
+Copy the example and fill in your keys:
 
 ```bash
 cp .env.example .env
-# Open .env and fill in your API keys (see the section below)
 ```
 
-### 4. Run — two terminals
+You will need API keys / credentials for:
 
-**Terminal 1 — MCP server** (must start first)
+- **Groq** — primary LLM
+- **Google Gemini** — fallback LLM
+- **Sarvam AI** — STT
+- **OpenAI** — TTS (`nova` voice)
+- **LiveKit** — URL, API key, API secret
+- **Supabase** — Postgres connection string
+- **Redis Cloud** — host, port, password
+
+### 4. Database
+
+Run the schema migration against your Supabase instance:
 
 ```bash
+psql "$SUPABASE_URL" -f migrations/init.sql
+```
+
+This creates the `conversations`, `tool_cache`, `preferences`, and `memories` tables.
+
+---
+
+## Running
+
+You can run the three processes individually, or use the launcher to spin them all up at once.
+
+### Individually
+
+```bash
+# Terminal 1 — MCP tool server
 uv run friday
+
+# Terminal 2 — Voice agent (connects to MCP over SSE)
+uv run friday_voice
+
+# Terminal 3 — Wake-word listener
+uv run jarvis_wake
 ```
 
-Starts the FastMCP server on `http://127.0.0.1:8000/sse`. The voice agent connects here to fetch its tools.
-
-**Terminal 2 — Voice agent**
+### All at once
 
 ```bash
-uv run friday_voice
+uv run python launcher.py
 ```
 
-Starts the LiveKit voice agent in **dev mode** — it joins a LiveKit room and begins listening. Open the [LiveKit Agents Playground](https://agents-playground.livekit.io) and connect to your room to talk to FRIDAY.
+### Auto-start on Windows boot
 
----
-
-## `uv run friday` vs `uv run friday_voice`
-
-| Command | Entry point | What it does |
-|---------|------------|--------------|
-| `uv run friday` | `server.py → main()` | Launches the **FastMCP server** over SSE transport on port 8000. This is the "brain backend" — it registers all tools, prompts, and resources that the LLM can call. |
-| `uv run friday_voice` | `agent_friday.py → dev()` | Launches the **LiveKit voice agent**. It builds the STT / LLM / TTS pipeline, connects to your LiveKit room, and wires up the MCP server as a tool source. The `dev()` wrapper auto-injects the `dev` CLI flag so you don't have to type it manually. |
-
-> Both processes must run **simultaneously**. The voice agent calls the MCP server in real time whenever it needs a tool (e.g. fetching news).
-
----
-
-## Environment variables
-
-Copy `.env.example` → `.env` and fill in the values below.
-
-| Variable | Required | Where to get it |
-|----------|----------|----------------|
-| `LIVEKIT_URL` | ✅ | [LiveKit Cloud dashboard](https://cloud.livekit.io) → your project URL |
-| `LIVEKIT_API_KEY` | ✅ | LiveKit Cloud → API Keys |
-| `LIVEKIT_API_SECRET` | ✅ | LiveKit Cloud → API Keys |
-| `GROQ_API_KEY` | optional | [console.groq.com](https://console.groq.com) — only needed if you switch `LLM_PROVIDER` to `"groq"` |
-| `SARVAM_API_KEY` | ✅ (default STT) | [dashboard.sarvam.ai](https://dashboard.sarvam.ai) |
-| `OPENAI_API_KEY` | ✅ (default TTS) | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
-| `DEEPGRAM_API_KEY` | optional | [console.deepgram.com](https://console.deepgram.com) |
-| `GOOGLE_APPLICATION_CREDENTIALS` | optional | GCP service-account JSON path — only for `STT_PROVIDER = "google"` |
-| `GOOGLE_API_KEY` | ✅ (default LLM) | [aistudio.google.com](https://aistudio.google.com/projects) |
-| `SUPABASE_URL` | optional | [supabase.com](https://supabase.com) — for the ticketing tool |
-| `SUPABASE_API_KEY` | optional | Supabase project → API settings |
-
----
-
-## Switching providers
-
-Open `agent_friday.py` and change the provider constants at the top:
-
-```python
-STT_PROVIDER = "sarvam"   # "sarvam" | "whisper"
-LLM_PROVIDER = "gemini"   # "gemini" | "openai"
-TTS_PROVIDER = "openai"   # "openai" | "sarvam"
+```bash
+uv run python setup_autostart.py
 ```
 
 ---
 
-## Adding a new tool
+## How wake-word works
 
-1. Create or open a file in `friday/tools/`
-2. Define a `register(mcp)` function and decorate tools with `@mcp.tool()`
-3. Import and call `register(mcp)` inside `friday/tools/__init__.py`
+`friday/wake/detector.py` runs a lightweight always-on listener:
 
-The MCP server will pick it up on next start.
+1. A **clap detector** watches the mic for two sharp amplitude spikes within a short window.
+2. On a double-clap it arms a **keyword listener** that waits a few seconds for the word *"JARVIS"*.
+3. If both fire, the LiveKit voice agent is activated and starts a conversation turn.
+
+This keeps CPU and network cost at zero while idle — no LLM or STT calls happen until you explicitly wake it.
 
 ---
 
-## Tech stack
+## Extending — adding a new tool
 
-- **[FastMCP](https://github.com/jlowin/fastmcp)** — MCP server framework
-- **[LiveKit Agents](https://github.com/livekit/agents)** — real-time voice pipeline
-- **Sarvam Saaras v3** — STT (Indian-English optimised)
-- **Google Gemini 2.5 Flash** — LLM
-- **OpenAI TTS** (`nova` voice) — TTS
-- **[uv](https://github.com/astral-sh/uv)** — fast Python package manager
+All capabilities are MCP tools. To add one:
+
+1. Create (or open) a file under `friday/tools/`, e.g. `friday/tools/music.py`.
+2. Define a function and decorate it so FastMCP picks it up.
+3. Register it in `friday/tools/__init__.py` alongside the existing tools.
+4. Use `@cached(ttl=300)` from `friday/db/redis_cache.py` for anything expensive / idempotent.
+5. For DB access, call `get_db()` from `friday/db/supabase_client.py`.
+
+The LLM will automatically discover the new tool over SSE — no prompt changes required.
+
+---
+
+## Status
+
+Actively being built. Core voice loop, MCP server, web tools, desktop control, wake word, and database layers are all working.
+
+---
+
+## Contributors
+
+**I am the only contributor to this project.** — Dushyant Atalkar
 
 ---
 
 ## License
 
-MIT
+Personal project. All rights reserved.

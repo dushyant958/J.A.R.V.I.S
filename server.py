@@ -13,10 +13,11 @@ from friday.config import config
 mcp = FastMCP(
     name=config.SERVER_NAME,
     instructions=(
-        "You are Friday, a Tony Stark-style AI assistant. "
-        "You have access to a set of tools to help the user. "
-        "Be concise, accurate, and a little witty."
+        f"You are J.A.R.V.I.S, the personal AI of {config.USER_NAME}. "
+        "You have full access to his desktop, browser, web, and system. "
+        "Be concise, sharp, and a little dry. Act, then report."
     ),
+    port=config.MCP_PORT,
 )
 
 # Register tools, prompts, and resources
