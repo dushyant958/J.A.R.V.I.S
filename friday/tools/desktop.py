@@ -1,7 +1,4 @@
-"""
-Desktop control tools — full PC control via voice.
-Lets JARVIS open apps, type text, click, take screenshots, manage windows.
-"""
+"""Desktop control tools."""
 
 import asyncio
 import os
@@ -10,30 +7,28 @@ import subprocess
 import time
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
 def _run_sync(fn, *args, **kwargs):
-    """Run a blocking call (pyautogui etc.) in a thread so we don't block the event loop."""
     return asyncio.get_running_loop().run_in_executor(None, lambda: fn(*args, **kwargs))
 
 
 def _get_pyautogui():
     try:
         import pyautogui
-        pyautogui.FAILSAFE = True  # Move mouse to top-left corner to abort
+        pyautogui.FAILSAFE = True
         pyautogui.PAUSE = 0.05
         return pyautogui
     except ImportError:
         raise RuntimeError("pyautogui not installed — run: uv add pyautogui")
 
 
-# ── Windows app name → executable mapping ────────────────────────────────────
+_EDGE_PATH = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+
 APP_MAP = {
     "chrome": "chrome",
     "google chrome": "chrome",
     "firefox": "firefox",
-    "edge": "msedge",
-    "microsoft edge": "msedge",
+    "edge": _EDGE_PATH,
+    "microsoft edge": _EDGE_PATH,
     "notepad": "notepad",
     "calculator": "calc",
     "file explorer": "explorer",
@@ -66,41 +61,37 @@ APP_MAP = {
 
 def register(mcp):
 
-    # ── Application Control ───────────────────────────────────────────────────
-
     @mcp.tool()
     async def open_application(app_name: str) -> str:
-        """
-        Open any application by name on the PC.
-        Examples: 'Google Chrome', 'Spotify', 'Notepad', 'VS Code', 'Calculator'.
-        """
+        """Open an application by name, e.g. 'Chrome', 'Spotify', 'Notepad'."""
         name_lower = app_name.lower().strip()
         executable = APP_MAP.get(name_lower, name_lower)
-
         try:
             if platform.system() == "Windows":
                 if executable.startswith("ms-"):
                     subprocess.Popen(["start", "", executable], shell=True)
+                elif os.path.isfile(executable):
+                    subprocess.Popen([executable], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 else:
-                    subprocess.Popen(
+                    result = subprocess.run(
                         executable, shell=True,
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                        capture_output=True, text=True, timeout=3
                     )
+                    if result.returncode != 0 and result.stderr:
+                        return f"Could not open {app_name}: {result.stderr.strip()}"
             else:
                 subprocess.Popen([executable], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return f"Opening {app_name}."
+        except subprocess.TimeoutExpired:
             return f"Opening {app_name}."
         except Exception as e:
             return f"Could not open {app_name}: {e}"
 
     @mcp.tool()
     async def close_application(app_name: str) -> str:
-        """
-        Close / kill a running application by name.
-        Example: close Chrome, close Notepad.
-        """
+        """Close a running application by name."""
         name_lower = app_name.lower().strip()
         executable = APP_MAP.get(name_lower, name_lower)
-        # Strip .exe if already there, then re-add
         exe_name = executable.replace(".exe", "") + ".exe"
         try:
             if platform.system() == "Windows":
@@ -119,10 +110,7 @@ def register(mcp):
 
     @mcp.tool()
     async def get_running_processes() -> str:
-        """
-        List currently running applications/processes on the PC.
-        Use when the user asks what's running or open.
-        """
+        """List currently running processes on the PC."""
         try:
             if platform.system() == "Windows":
                 result = subprocess.run(
@@ -130,12 +118,8 @@ def register(mcp):
                     capture_output=True, text=True
                 )
                 lines = result.stdout.strip().split("\n")[:20]
-                processes = []
-                for line in lines:
-                    parts = line.strip('"').split('","')
-                    if parts:
-                        processes.append(parts[0])
-                return "Running processes: " + ", ".join(processes[:20])
+                processes = [line.strip('"').split('","')[0] for line in lines if line]
+                return "Running: " + ", ".join(processes[:20])
             else:
                 result = subprocess.run(["ps", "-e", "-o", "comm="], capture_output=True, text=True)
                 procs = list(set(result.stdout.strip().split("\n")))[:20]
@@ -143,30 +127,21 @@ def register(mcp):
         except Exception as e:
             return f"Could not list processes: {e}"
 
-    # ── Keyboard & Typing ─────────────────────────────────────────────────────
-
     @mcp.tool()
     async def type_text(text: str, interval: float = 0.03) -> str:
-        """
-        Type text as if from a keyboard at the current cursor position.
-        Use after clicking on a text field/search bar.
-        Interval controls typing speed in seconds between keystrokes.
-        """
+        """Type text at the current cursor position (supports Unicode)."""
         try:
+            proc = subprocess.Popen(["clip"], stdin=subprocess.PIPE)
+            proc.communicate(input=text.encode("utf-8"))
             pag = _get_pyautogui()
-            # Use write() for Unicode support; typewrite() only handles ASCII
-            await asyncio.to_thread(pag.write, text, interval=interval)
+            await asyncio.to_thread(pag.hotkey, "ctrl", "v")
             return f"Typed: {text}"
         except Exception as e:
             return f"Could not type text: {e}"
 
     @mcp.tool()
     async def press_key(key: str) -> str:
-        """
-        Press a keyboard key or key combination.
-        Examples: 'enter', 'escape', 'ctrl+c', 'ctrl+v', 'alt+tab', 'win', 'f5', 'backspace'.
-        Use '+' to combine keys, e.g. 'ctrl+shift+t' to reopen a tab.
-        """
+        """Press a key or combo, e.g. 'enter', 'ctrl+c', 'alt+tab', 'win'."""
         try:
             pag = _get_pyautogui()
             keys = [k.strip() for k in key.lower().split("+")]
@@ -182,23 +157,15 @@ def register(mcp):
     async def copy_to_clipboard(text: str) -> str:
         """Copy text to the system clipboard."""
         try:
-            proc = subprocess.Popen(
-                ["clip"], stdin=subprocess.PIPE
-            )
+            proc = subprocess.Popen(["clip"], stdin=subprocess.PIPE)
             proc.communicate(input=text.encode("utf-8"))
             return "Copied to clipboard."
         except Exception as e:
             return f"Could not copy to clipboard: {e}"
 
-    # ── Mouse Control ─────────────────────────────────────────────────────────
-
     @mcp.tool()
     async def click_at(x: int, y: int, button: str = "left") -> str:
-        """
-        Click the mouse at screen coordinates (x, y).
-        button can be 'left', 'right', or 'middle'.
-        Get coordinates from take_screenshot first to identify where to click.
-        """
+        """Click at screen coordinates (x, y). button: 'left', 'right', 'middle'."""
         try:
             pag = _get_pyautogui()
             await asyncio.to_thread(pag.click, x, y, button=button)
@@ -218,10 +185,7 @@ def register(mcp):
 
     @mcp.tool()
     async def scroll(direction: str, amount: int = 3) -> str:
-        """
-        Scroll the mouse wheel up or down.
-        direction: 'up' or 'down'. amount: number of scroll clicks (1-10).
-        """
+        """Scroll mouse wheel. direction: 'up' or 'down', amount: 1-10."""
         try:
             pag = _get_pyautogui()
             clicks = amount if direction.lower() == "up" else -amount
@@ -232,7 +196,7 @@ def register(mcp):
 
     @mcp.tool()
     async def move_mouse(x: int, y: int) -> str:
-        """Move the mouse cursor to (x, y) without clicking."""
+        """Move mouse cursor to (x, y) without clicking."""
         try:
             pag = _get_pyautogui()
             await asyncio.to_thread(pag.moveTo, x, y, duration=0.2)
@@ -240,50 +204,37 @@ def register(mcp):
         except Exception as e:
             return f"Could not move mouse: {e}"
 
-    # ── Screen / Vision ───────────────────────────────────────────────────────
-
     @mcp.tool()
-    async def take_screenshot(region: str = "full") -> str:
-        """
-        Take a screenshot of the entire screen and save it to a temp file.
-        Returns the file path so JARVIS can reference what's on screen.
-        region: 'full' for the whole screen.
-        Use this to see what's currently on the screen before clicking.
-        """
+    async def take_screenshot() -> str:
+        """Take a screenshot and save to temp file. Returns the file path."""
         try:
             pag = _get_pyautogui()
-            import tempfile, os
+            import tempfile
             path = os.path.join(tempfile.gettempdir(), "jarvis_screen.png")
             await asyncio.to_thread(lambda: pag.screenshot(path))
             size = pag.size()
-            return f"Screenshot saved to {path}. Screen size: {size.width}x{size.height}."
+            return f"Screenshot saved to {path}. Screen: {size.width}x{size.height}."
         except Exception as e:
             return f"Could not take screenshot: {e}"
 
     @mcp.tool()
     async def get_screen_size() -> str:
-        """Get the current screen resolution/size."""
+        """Get the current screen resolution."""
         try:
             pag = _get_pyautogui()
             size = pag.size()
-            return f"Screen size: {size.width}x{size.height} pixels."
+            return f"Screen: {size.width}x{size.height}."
         except Exception as e:
             return f"Could not get screen size: {e}"
 
-    # ── Window Management ─────────────────────────────────────────────────────
-
     @mcp.tool()
     async def get_active_window() -> str:
-        """Get the title of the currently focused/active window."""
+        """Get the title of the currently focused window."""
         try:
-            pag = _get_pyautogui()
             import pygetwindow as gw
             win = gw.getActiveWindow()
-            if win:
-                return f"Active window: '{win.title}'"
-            return "No active window detected."
+            return f"Active window: '{win.title}'" if win else "No active window."
         except ImportError:
-            # Fallback using Windows API
             try:
                 import ctypes
                 hwnd = ctypes.windll.user32.GetForegroundWindow()
@@ -298,34 +249,27 @@ def register(mcp):
 
     @mcp.tool()
     async def list_open_windows() -> str:
-        """List all currently open windows on the desktop."""
+        """List all open windows on the desktop."""
         try:
             import pygetwindow as gw
             windows = [w.title for w in gw.getAllWindows() if w.title.strip()]
             return "Open windows: " + ", ".join(windows[:20]) if windows else "No windows found."
         except ImportError:
-            return "Install pygetwindow for window listing: uv add pygetwindow"
+            return "Install pygetwindow: uv add pygetwindow"
         except Exception as e:
             return f"Could not list windows: {e}"
 
     @mcp.tool()
     async def focus_window(window_title: str) -> str:
-        """
-        Bring a window to focus by its title (partial match is fine).
-        Example: 'Chrome', 'Notepad', 'Spotify'.
-        """
+        """Bring a window to focus by partial title match."""
         try:
             import pygetwindow as gw
             matches = [w for w in gw.getAllWindows()
                        if window_title.lower() in w.title.lower() and w.title.strip()]
             if not matches:
-                return f"No window found matching '{window_title}'."
-            win = matches[0]
-            await asyncio.to_thread(win.activate)
-            return f"Focused window: '{win.title}'."
-        except ImportError:
-            # Fallback: use Alt+Tab heuristic or open app
-            return "pygetwindow not installed — run: uv add pygetwindow"
+                return f"No window matching '{window_title}'."
+            await asyncio.to_thread(matches[0].activate)
+            return f"Focused: '{matches[0].title}'."
         except Exception as e:
             return f"Could not focus window: {e}"
 
@@ -339,33 +283,26 @@ def register(mcp):
                 if win:
                     await asyncio.to_thread(win.minimize)
                     return f"Minimized '{win.title}'."
-                return "No active window to minimize."
+                return "No active window."
             else:
                 matches = [w for w in gw.getAllWindows()
                            if window_title.lower() in w.title.lower()]
                 if matches:
                     await asyncio.to_thread(matches[0].minimize)
                     return f"Minimized {window_title}."
-                return f"No window found matching '{window_title}'."
+                return f"No window matching '{window_title}'."
         except Exception as e:
             return f"Could not minimize: {e}"
 
-    # ── System Actions ────────────────────────────────────────────────────────
-
     @mcp.tool()
     async def run_shell_command(command: str) -> str:
-        """
-        Run a shell command and return its output.
-        Use for tasks like creating files, running scripts, checking system info.
-        CAUTION: Only run safe, user-requested commands.
-        """
+        """Run a shell command and return its output."""
         try:
             result = await asyncio.to_thread(
                 subprocess.run,
                 command, shell=True, capture_output=True, text=True, timeout=30
             )
-            output = result.stdout or result.stderr or "(no output)"
-            return output[:2000]
+            return (result.stdout or result.stderr or "(no output)")[:2000]
         except subprocess.TimeoutExpired:
             return "Command timed out after 30 seconds."
         except Exception as e:
@@ -373,10 +310,7 @@ def register(mcp):
 
     @mcp.tool()
     async def set_volume(level: int) -> str:
-        """
-        Set the system volume level (0-100).
-        Example: set_volume(50) for 50% volume.
-        """
+        """Set system volume 0-100."""
         try:
             if platform.system() == "Windows":
                 ps_cmd = f"""
@@ -421,20 +355,15 @@ def register(mcp):
 
     @mcp.tool()
     async def open_url_in_browser(url: str, browser: str = "default") -> str:
-        """
-        Open a URL directly in a specific browser.
-        browser: 'default', 'chrome', 'firefox', 'edge'.
-        Use this to navigate to websites, open Google, Gmail, YouTube, etc.
-        """
+        """Open a URL in a browser. browser: 'default', 'chrome', 'firefox', 'edge'."""
         import webbrowser
         try:
             if browser == "default" or browser not in ("chrome", "firefox", "edge"):
                 webbrowser.open(url)
             else:
-                # webbrowser.get("chrome") doesn't work on Windows — launch directly
-                exe_map = {"chrome": "chrome", "firefox": "firefox", "edge": "msedge"}
-                subprocess.Popen([exe_map[browser], url], shell=True,
+                exe_map = {"chrome": "chrome", "firefox": "firefox", "edge": _EDGE_PATH}
+                subprocess.Popen([exe_map[browser], url],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return f"Opened {url} in {browser} browser."
+            return f"Opened {url} in {browser}."
         except Exception as e:
             return f"Could not open URL: {e}"

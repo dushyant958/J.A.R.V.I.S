@@ -21,11 +21,9 @@ def register(mcp):
         return now.strftime("%A, %d %B %Y, %I:%M %p %Z")
 
     @mcp.tool()
-    def get_system_info() -> dict:
+    def get_system_info() -> str:
         """Return basic information about the host system."""
-        return {
-            "os": platform.system(),
-            "os_version": platform.version(),
-            "machine": platform.machine(),
-            "python_version": platform.python_version(),
-        }
+        return (
+            f"{platform.system()} {platform.machine()}, "
+            f"Python {platform.python_version()}"
+        )

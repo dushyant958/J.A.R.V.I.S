@@ -25,8 +25,17 @@ register_all_tools(mcp)
 register_all_prompts(mcp)
 register_all_resources(mcp)
 
+app = mcp.sse_app()
+
 def main():
-    mcp.run(transport='sse')
+    import sys
+    import uvicorn
+    reload = "--reload" in sys.argv
+    uvicorn.run(
+        "server:app" if reload else app,
+        host="127.0.0.1", port=config.MCP_PORT,
+        log_level="info", reload=reload,
+    )
 
 if __name__ == "__main__":
     main()

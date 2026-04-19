@@ -30,6 +30,8 @@ dependencies = [
     "sounddevice",
     "numpy",
     "SpeechRecognition",
+    "tzdata",
+    "uvicorn",
 ]
 
 [project.scripts]

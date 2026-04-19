@@ -65,11 +65,9 @@ class SupabaseClient:
         if not self._sb:
             return
         try:
-            await self._sb.table("messages").insert({
-                "session_id": session_id,
-                "role": role,
-                "content": content,
-            }).execute()
+            await self._sb.table("conversations").insert(
+                {"session_id": session_id, "role": role, "content": content}
+            ).execute()
         except Exception as e:
             logger.error("save_message failed: %s", e)
 
@@ -78,7 +76,7 @@ class SupabaseClient:
             return []
         try:
             result = await (
-                self._sb.table("messages")
+                self._sb.table("conversations")
                 .select("role, content, created_at")
                 .eq("session_id", session_id)
                 .order("created_at", desc=False)

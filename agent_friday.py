@@ -2,10 +2,10 @@
 J.A.R.V.I.S – Voice Agent (MCP-powered)
 =========================================
 Tony Stark-style personal AI for Dushyant.
-LLM: Groq (llama-3.3-70b-versatile) — primary, ultra-fast inference
-     Google Gemini 2.5 Flash — fallback
+LLM: Google Gemini 2.5 Flash — primary
+     Groq llama-3.3-70b — fallback
 STT: Sarvam Saaras v3 (Indian-English optimised)
-TTS: OpenAI nova
+TTS: Sarvam Bulbul v3 (advait)
 
 Run:
   uv run friday_voice        – LiveKit Cloud mode (auto-injects 'dev')
@@ -14,11 +14,14 @@ Run:
 
 import os
 import logging
+from zoneinfo import ZoneInfo
+from datetime import datetime
 
 from dotenv import load_dotenv
-from livekit.agents import JobContext, WorkerOptions, cli
+from livekit.agents import JobContext, WorkerOptions, cli, utils as lk_utils
 from livekit.agents.voice import Agent, AgentSession
-from livekit.agents.llm import mcp
+from livekit.agents.llm import mcp, ChatContext
+from livekit.agents.llm.mcp import MCPToolset
 
 from livekit.plugins import openai as lk_openai, google as lk_google, sarvam, silero
 
@@ -27,15 +30,15 @@ from livekit.plugins import openai as lk_openai, google as lk_google, sarvam, si
 # ---------------------------------------------------------------------------
 
 STT_PROVIDER = "sarvam"    # "sarvam" | "whisper"
-LLM_PROVIDER = "gemini"    # "groq" | "gemini" | "openai"
+LLM_PROVIDER = "groq"      # "groq" | "gemini" | "openai"
 TTS_PROVIDER = "sarvam"    # "sarvam" | "openai"
 
-# Groq — best balance of speed + quality for voice
+AUTO_GREET = True          # False = stay silent until user speaks first
+
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
-# Fallback models
-GEMINI_LLM_MODEL = "gemini-2.5-flash"
+GEMINI_LLM_MODEL = "gemini-2.0-flash"  # free tier: 15 RPM vs 5 RPM for 2.5-flash
 OPENAI_LLM_MODEL = "gpt-4o-mini"
 
 OPENAI_TTS_MODEL = "tts-1"
@@ -43,22 +46,32 @@ OPENAI_TTS_VOICE = "nova"
 TTS_SPEED = 1.15
 
 SARVAM_TTS_LANGUAGE = "en-IN"
-SARVAM_TTS_SPEAKER = "rahul"
+SARVAM_TTS_SPEAKER = "advait"
 
 MCP_SERVER_PORT = int(os.getenv("MCP_PORT", "8001"))
 
+# Max conversation turns kept in context — keeps token usage bounded
+MAX_HISTORY_ITEMS = 10
+
 # ---------------------------------------------------------------------------
-# System prompt — personalised for Dushyant
+# System prompt
 # ---------------------------------------------------------------------------
 
 USER_NAME = os.getenv("JARVIS_USER_NAME", "Boss")
 
 SYSTEM_PROMPT = f"""You are J.A.R.V.I.S, the personal AI of {USER_NAME}. You run on his PC with full desktop, browser, and web access. Timezone: IST.
 
-Personality: calm, composed, dry wit. Greet {USER_NAME} by name once per session, then just talk naturally. Two to four sentences max. No markdown, no lists — you are speaking. Never mention tool names.
+Personality: calm, composed, dry wit. Greet {USER_NAME} by name once per session, then just talk naturally. Two to four sentences max. Never mention tool names.
 
-Rules:
-- Answer from knowledge first. Only search the web for live data (weather, news, prices).
+Speech rules — you are being spoken aloud via TTS:
+- No markdown, no lists, no bullet points, no numbered items, no asterisks, no underscores.
+- Never read out raw data. Always convert tool results into natural spoken sentences.
+- For news: pick the two or three most interesting headlines and say them conversationally.
+- For time/date: say it as a human would ("It's half past nine on a Sunday evening").
+- For search results: summarise the key fact in one sentence, don't list sources.
+
+Action rules:
+- Answer from knowledge first. Only use tools for live data (weather, news, prices, desktop actions).
 - Act first, then report. Don't announce what you're about to do.
 - Screenshot before clicking. If a tool fails, say so calmly.
 - Stay in character always. You are J.A.R.V.I.S, not a chatbot.""".strip()
@@ -71,22 +84,26 @@ load_dotenv(override=True)
 logger = logging.getLogger("jarvis-agent")
 logger.setLevel(logging.INFO)
 
-# Debug: verify which keys are actually loaded
 _groq_key = os.getenv("GROQ_API_KEY", "")
 _google_key = os.getenv("GOOGLE_API_KEY", "")
-print(f"[BOOT] GROQ_API_KEY   = {_groq_key[:8]}...{_groq_key[-4:]}" if _groq_key else "[BOOT] GROQ_API_KEY   = NOT SET")
-print(f"[BOOT] GOOGLE_API_KEY = {_google_key[:8]}...{_google_key[-4:]}" if _google_key else "[BOOT] GOOGLE_API_KEY = NOT SET")
-print(f"[BOOT] LLM_PROVIDER   = {LLM_PROVIDER}")
+logger.info("GROQ_API_KEY   = %s", f"{_groq_key[:8]}..." if _groq_key else "NOT SET")
+logger.info("GOOGLE_API_KEY = %s", f"{_google_key[:8]}..." if _google_key else "NOT SET")
+logger.info("LLM_PROVIDER   = %s", LLM_PROVIDER)
 
 
 # ---------------------------------------------------------------------------
-# MCP server URL
+# MCP toolset
 # ---------------------------------------------------------------------------
 
-def _mcp_server_url() -> str:
+def _build_mcp_toolset() -> MCPToolset:
     url = f"http://127.0.0.1:{MCP_SERVER_PORT}/sse"
     logger.info("MCP Server: %s", url)
-    return url
+    server = mcp.MCPServerHTTP(
+        url=url,
+        transport_type="sse",
+        client_session_timeout_seconds=30,
+    )
+    return MCPToolset(id=lk_utils.shortuuid("mcp_"), mcp_server=server)
 
 
 # ---------------------------------------------------------------------------
@@ -95,10 +112,10 @@ def _mcp_server_url() -> str:
 
 def _build_stt():
     if STT_PROVIDER == "sarvam":
-        logger.info("STT → Sarvam (en-IN, defaults)")
+        logger.info("STT -> Sarvam (en-IN)")
         return sarvam.STT(language="en-IN")
     elif STT_PROVIDER == "whisper":
-        logger.info("STT → OpenAI Whisper")
+        logger.info("STT -> OpenAI Whisper")
         return lk_openai.STT(model="whisper-1")
     else:
         raise ValueError(f"Unknown STT_PROVIDER: {STT_PROVIDER!r}")
@@ -106,21 +123,20 @@ def _build_stt():
 
 def _build_llm():
     if LLM_PROVIDER == "groq":
-        logger.info("LLM → Groq (%s)", GROQ_MODEL)
-        # Groq uses OpenAI-compatible API — fastest inference available
+        logger.info("LLM -> Groq (%s)", GROQ_MODEL)
         return lk_openai.LLM(
             model=GROQ_MODEL,
             base_url=GROQ_BASE_URL,
             api_key=os.getenv("GROQ_API_KEY"),
         )
     elif LLM_PROVIDER == "gemini":
-        logger.info("LLM → Google Gemini (%s)", GEMINI_LLM_MODEL)
+        logger.info("LLM -> Gemini (%s) with Groq fallback", GEMINI_LLM_MODEL)
         return lk_google.LLM(
             model=GEMINI_LLM_MODEL,
             api_key=os.getenv("GOOGLE_API_KEY"),
         )
     elif LLM_PROVIDER == "openai":
-        logger.info("LLM → OpenAI (%s)", OPENAI_LLM_MODEL)
+        logger.info("LLM -> OpenAI (%s)", OPENAI_LLM_MODEL)
         return lk_openai.LLM(model=OPENAI_LLM_MODEL)
     else:
         raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER!r}")
@@ -128,7 +144,7 @@ def _build_llm():
 
 def _build_tts():
     if TTS_PROVIDER == "sarvam":
-        logger.info("TTS → Sarvam Bulbul v3 (advait)")
+        logger.info("TTS -> Sarvam Bulbul v3 (advait)")
         return sarvam.TTS(
             target_language_code="en-IN",
             model="bulbul:v3",
@@ -136,7 +152,7 @@ def _build_tts():
             pace=TTS_SPEED,
         )
     elif TTS_PROVIDER == "openai":
-        logger.info("TTS → OpenAI TTS (%s / %s)", OPENAI_TTS_MODEL, OPENAI_TTS_VOICE)
+        logger.info("TTS -> OpenAI TTS (%s / %s)", OPENAI_TTS_MODEL, OPENAI_TTS_VOICE)
         return lk_openai.TTS(
             model=OPENAI_TTS_MODEL,
             voice=OPENAI_TTS_VOICE,
@@ -151,10 +167,7 @@ def _build_tts():
 # ---------------------------------------------------------------------------
 
 class JarvisAgent(Agent):
-    """
-    J.A.R.V.I.S — full-desktop AI for Dushyant.
-    All tools are served by the FastMCP server over SSE.
-    """
+    """J.A.R.V.I.S — full-desktop AI for Dushyant."""
 
     def __init__(self, stt, llm, tts) -> None:
         super().__init__(
@@ -163,71 +176,51 @@ class JarvisAgent(Agent):
             llm=llm,
             tts=tts,
             vad=silero.VAD.load(),
-            mcp_servers=[
-                mcp.MCPServerHTTP(
-                    url=_mcp_server_url(),
-                    transport_type="sse",
-                    client_session_timeout_seconds=30,
-                ),
-            ],
+            tools=[_build_mcp_toolset()],
         )
 
     async def on_enter(self) -> None:
-        """Greet Dushyant on session start."""
+        if not AUTO_GREET:
+            return
+        now = datetime.now(ZoneInfo("Asia/Kolkata"))
+        time_str = now.strftime("%I:%M %p")
         await self.session.generate_reply(
             instructions=(
-                f"Greet {USER_NAME} by name. "
-                "If it's late at night, acknowledge it. "
-                "Keep it to one sentence. Stay in character as J.A.R.V.I.S."
+                f"Greet {USER_NAME} in one short sentence. "
+                f"Current time is {time_str} IST. Dry wit, stay in character as J.A.R.V.I.S."
             )
         )
+
+    async def llm_node(self, chat_ctx: ChatContext, tools, model_settings):
+        truncated = chat_ctx.truncate(max_items=MAX_HISTORY_ITEMS)
+        return Agent.default.llm_node(self, truncated, tools, model_settings)
 
 
 # ---------------------------------------------------------------------------
 # LiveKit entry point
 # ---------------------------------------------------------------------------
 
-def _turn_detection() -> str:
-    return "vad"
-
-
-def _endpointing_delay() -> float:
-    return 0.3
-
-
 async def entrypoint(ctx: JobContext) -> None:
-    print(f"\n>>> JARVIS ENTRYPOINT CALLED — room: {ctx.room.name}\n", flush=True)
+    logger.info("JARVIS entrypoint called — room: %s", ctx.room.name)
 
     try:
-        print(">>> Building STT...", flush=True)
         stt = _build_stt()
-        print(">>> STT OK", flush=True)
-
-        print(">>> Building LLM...", flush=True)
         llm = _build_llm()
-        print(">>> LLM OK", flush=True)
-
-        print(">>> Building TTS...", flush=True)
         tts = _build_tts()
-        print(">>> TTS OK", flush=True)
 
-        print(">>> Creating session...", flush=True)
         session = AgentSession(
-            turn_detection=_turn_detection(),
-            min_endpointing_delay=_endpointing_delay(),
+            turn_detection="vad",
+            min_endpointing_delay=0.3,
         )
-        print(">>> Session OK", flush=True)
 
-        print(">>> Starting agent...", flush=True)
         await session.start(
             agent=JarvisAgent(stt=stt, llm=llm, tts=tts),
             room=ctx.room,
         )
-        print(">>> Agent started successfully!", flush=True)
-    except Exception as e:
-        print(f"\n>>> JARVIS STARTUP FAILED: {e}\n", flush=True)
-        import traceback
-        traceback.print_exc()
+        logger.info("JARVIS agent started successfully")
+    except Exception:
+        logger.exception("JARVIS startup failed")
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -235,11 +228,10 @@ async def entrypoint(ctx: JobContext) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="jarvis"))
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
 
 
 def dev():
-    """Wrapper to run the agent in dev mode automatically."""
     import sys
     if len(sys.argv) == 1:
         sys.argv.append("dev")
